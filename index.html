@@ -7,7 +7,6 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<script src="https://js.puter.com/v2/"></script>
 <style>
 /* Layout: left chat rail + centered conversation column with a pinned composer. */
 :root{
@@ -174,23 +173,30 @@ button:focus-visible,textarea:focus-visible,a:focus-visible{outline:2px solid va
           <button type="submit" class="send" id="send" aria-label="Send message" disabled>↑</button>
         </div>
       </form>
-      <p class="fine">Omega has no message limit of its own. Usage is billed to your Puter account.</p>
+      <p class="fine">Omega has no message limit of its own. The free model may rate-limit you if you send a lot.</p>
     </div>
   </main>
 </div>
 
 <script>
+/* ---------- Proxy config ----------
+   The OpenRouter key lives in the Cloudflare Worker (worker.js), not in this page.
+   After deploying the Worker, paste its URL here. The Worker also pins the model. */
+const WORKER_URL = "https://omega-proxy.croman723.workers.dev/";
+const MODEL_SHORT = "nemotron-3.5-super-vl";
+
 /* ---------- Effort levels ----------
-   Model ids come from the Puter.js Claude tutorial. Ultra max runs two passes:
-   a private planning pass, then a final answer that must check itself against the plan. */
-const BASE = "You are Omega, an AI assistant. Be accurate, direct and useful. Format with Markdown when it helps. If asked which model powers you, say you run on Claude models through Puter.";
+   Every level uses the same model now, so effort changes the instructions and the reasoning
+   setting sent to OpenRouter. Ultra max runs two passes: a private planning pass, then a final
+   answer that must check itself against the plan (that costs two requests per message). */
+const BASE = "You are Omega, an AI assistant. Be accurate, direct and useful. Format with Markdown when it helps. If asked which model powers you, say you run on NVIDIA Nemotron through OpenRouter.";
 const LEVELS = [
-  {id:"low",   name:"Low",       desc:"Fast and brief",                       model:"claude-haiku-5-5",  sys:"Answer directly and briefly. Skip preamble."},
-  {id:"medium",name:"Medium",    desc:"Balanced for everyday questions",       model:"claude-sonnet-5-5", sys:"Give clear, accurate answers at a natural length."},
-  {id:"high",  name:"High",      desc:"Works through it step by step",         model:"claude-sonnet-5-5", sys:"Think the problem through step by step before you answer. Check your work, then give a well organised answer."},
-  {id:"extra", name:"Extra",     desc:"Stronger model, thorough answers",      model:"claude-opus-5-5",   sys:"Be thorough. Consider alternatives and edge cases, verify details, and explain your reasoning where it matters."},
-  {id:"max",   name:"Max",       desc:"Most capable model, deep reasoning",    model:"claude-fable-5-1",  sys:"Reason deeply and carefully. Break the problem into parts, test your conclusions against every constraint, and only then answer."},
-  {id:"ultra", name:"Ultra max", desc:"Most capable model with plan, then verify", model:"claude-fable-5-1", passes:2, sys:"Your final answer must be correct, complete and checked. Use the private notes to avoid every error they flag."}
+  {id:"low",   name:"Low",       desc:"Fast and brief",                         eff:"low",    sys:"Answer directly and briefly. Skip preamble."},
+  {id:"medium",name:"Medium",    desc:"Balanced for everyday questions",         eff:"medium", sys:"Give clear, accurate answers at a natural length."},
+  {id:"high",  name:"High",      desc:"Works through it step by step",           eff:"high",   sys:"Think the problem through step by step before you answer. Check your work, then give a well organised answer."},
+  {id:"extra", name:"Extra",     desc:"Thorough answers, checks edge cases",     eff:"high",   sys:"Be thorough. Consider alternatives and edge cases, verify details, and explain your reasoning where it matters."},
+  {id:"max",   name:"Max",       desc:"Deep reasoning",                          eff:"high",   sys:"Reason deeply and carefully. Break the problem into parts, test your conclusions against every constraint, and only then answer."},
+  {id:"ultra", name:"Ultra max", desc:"Plans first, then verifies (2 requests)", eff:"high",   passes:2, sys:"Your final answer must be correct, complete and checked. Use the private notes to avoid every error they flag."}
 ];
 const PLAN_SYS = BASE + "\n\nThis is a private planning pass. Do not write the final answer. Write working notes only: restate the task, list constraints, try two or more approaches, find likely mistakes and edge cases, and state the conclusion you will give. Be dense and specific.";
 
@@ -331,22 +337,48 @@ function renderEffort(){
   $("effBars").innerHTML = bars(idx); $("effName").textContent = level().name;
   $("effPop").innerHTML = LEVELS.map((l, i) =>
     '<button type="button" class="opt' + (l.id === effort ? " on" : "") + '" role="option" aria-selected="' + (l.id === effort) + '" data-eff="' + l.id + '">' +
-    '<span class="bars" aria-hidden="true">' + bars(i + 1) + '</span><span class="txt"><b>' + l.name + '</b><span>' + l.desc + '</span></span><em>' + (l.passes ? "2 passes" : l.model.replace("claude-", "")) + '</em></button>').join("");
+    '<span class="bars" aria-hidden="true">' + bars(i + 1) + '</span><span class="txt"><b>' + l.name + '</b><span>' + l.desc + '</span></span><em>' + (l.passes ? "2 passes" : "") + '</em></button>').join("");
 }
 function togglePop(open){
   const pop = $("effPop"); const show = open ?? pop.hidden;
   pop.hidden = !show; $("effBtn").setAttribute("aria-expanded", String(show));
 }
 
-/* ---------- Puter streaming ---------- */
-async function streamModel(model, messages, onText, onReason){
-  if(typeof puter === "undefined" || !puter.ai) throw new Error("Puter.js did not load. Check your connection and that this page is served over http(s), then reload.");
-  const resp = await puter.ai.chat(messages, { model, stream: true, signal: abortCtl.signal });
-  for await (const part of resp){
-    if(!part) continue;
-    if(part.type === "error") throw new Error(part.message || "The model returned an error.");
-    if(part.type === "reasoning"){ const r = part.reasoning ?? part.text; if(r) onReason && onReason(r); continue; }
-    if(part.text && (!part.type || part.type === "text")) onText(part.text);
+/* ---------- OpenRouter streaming ---------- */
+async function streamModel(lvl, messages, onText, onReason){
+  if(!WORKER_URL || WORKER_URL.includes("YOUR-SUBDOMAIN")) throw new Error("Set WORKER_URL at the top of the script to your deployed Cloudflare Worker URL.");
+  const res = await fetch(WORKER_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages, reasoning: { effort: lvl.eff } }),
+    signal: abortCtl.signal
+  });
+  if(!res.ok){
+    let msg = "";
+    try{ const j = await res.json(); msg = (j.error && j.error.message) || ""; }catch(e){}
+    if(res.status === 401) msg = "OpenRouter rejected the key stored in the Worker. " + msg;
+    else if(res.status === 403) msg = "The Worker blocked this site. Add it to ALLOWED_ORIGINS. " + msg;
+    else if(res.status === 429) msg = "Rate limited. Free models have request caps, so wait a bit and try again. " + msg;
+    throw new Error(msg.trim() || ("Request failed with status " + res.status));
+  }
+  const reader = res.body.getReader(), dec = new TextDecoder(); let buf = "";
+  while(true){
+    const { done, value } = await reader.read();
+    if(done) break;
+    buf += dec.decode(value, { stream: true });
+    let nl;
+    while((nl = buf.indexOf("\n")) >= 0){
+      const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+      if(!line.startsWith("data:")) continue;   // skips blank lines and ": OPENROUTER PROCESSING" keepalives
+      const data = line.slice(5).trim();
+      if(data === "[DONE]") return;
+      let j; try{ j = JSON.parse(data); }catch(e){ continue; }
+      if(j.error) throw new Error(j.error.message || "The model returned an error.");
+      const d = j.choices && j.choices[0] && j.choices[0].delta; if(!d) continue;
+      const r = d.reasoning ?? d.reasoning_content;
+      if(r && onReason) onReason(r);
+      if(d.content) onText(d.content);
+    }
   }
 }
 async function respond(c){
@@ -356,21 +388,22 @@ async function respond(c){
     let sys = BASE + "\n\n" + lvl.sys;
     if(lvl.passes === 2){
       a.thinking = true; a.think = ""; paintLast();
-      await streamModel(lvl.model, [{ role: "system", content: PLAN_SYS }, ...hist], t => { a.think += t; paintLast(); }, t => { a.think += t; paintLast(); });
+      await streamModel(lvl, [{ role: "system", content: PLAN_SYS }, ...hist], t => { a.think += t; paintLast(); }, t => { a.think += t; paintLast(); });
       a.thinking = false;
       sys += "\n\nPrivate notes from your planning pass (never quote or mention them):\n" + a.think.slice(0, 24000);
     }
-    await streamModel(lvl.model, [{ role: "system", content: sys }, ...hist],
+    await streamModel(lvl, [{ role: "system", content: sys }, ...hist],
       t => { a.content += t; paintLast(); },
       t => { a.think = (a.think || "") + t; a.thinking = !a.content; paintLast(); });
     a.thinking = false;
+    if(!a.content) a.error = "The model sent back an empty reply. Try again.";
   }catch(e){
     a.thinking = false;
     if(e && e.name === "AbortError"){ a.meta = "Stopped"; }
     else a.error = (e && (e.message || e.code)) ? String(e.message || e.code) : "Something went wrong. Try again.";
   }
   a.pending = false;
-  if(!a.error && a.meta !== "Stopped") a.meta = lvl.name + " · " + (lvl.passes ? "2 passes · " : "") + lvl.model.replace("claude-", "") + " · " + ((performance.now() - t0) / 1000).toFixed(1) + "s";
+  if(!a.error && a.meta !== "Stopped") a.meta = lvl.name + " · " + (lvl.passes ? "2 passes · " : "") + MODEL_SHORT + " · " + ((performance.now() - t0) / 1000).toFixed(1) + "s";
   c.t = Date.now(); save(); busy = false; abortCtl = null; setSend(); paintLast();
 }
 
